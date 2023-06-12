@@ -1,0 +1,6 @@
+scipy == 1.9.3
+pandas
+matplotlib
+seaborn
+dill
+numpy
