@@ -1,0 +1,3 @@
+# constraint-pure-exploration
+
+Code for Pure-Exploration in Bandits with linear constraints. Cite as...
