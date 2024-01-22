@@ -10,5 +10,6 @@ Cite as:
       year={2024},
       journal={International Conference on Artificial
       Intelligence and Statistics},
+      volume={27},
       publisher={PMLR}
 }
