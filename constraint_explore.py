@@ -1,5 +1,5 @@
 import numpy as np
-from scipy.optimize import linprog, minimize, LinearConstraint
+from scipy.optimize import linprog, minimize, LinearConstraint, OptimizeResult
 import itertools
 from copy import deepcopy
 
@@ -202,6 +202,73 @@ def get_confidence_interval(mu, pulls, f_t, upper=6, lower=-1, kl=None):
     lb = [
         binary_search(m, np.linspace(m, lower, 5000), threshold=f_t / n, kl=kl)[0]
         for m, n in zip(mu, pulls)
+    ]
+
+    return lb, ub
+
+def binary_search_lipschitz(mu, pulls, interval, threshold, kl, lip_fun, arm, n_arms, mode=None):
+    """
+    Find maximizer of KL(mu, x) in interval satysfiyng threshold using binary search
+    :param mu: reward of arm
+    :param interval: interval to search in
+    :param threshold: threshold to satisfy (f(t) = log t)
+    :param kl: KL divergence function
+
+    """
+    p = 0
+    q = len(interval)
+    done = False
+    while not done:
+        i = int((p + q) / 2)
+        x = interval[i]
+        if mode=="upper":
+            loss = np.sum([pulls*kl(mu, x - lip_fun[arm, k]) for k in range(n_arms)])
+        else:
+            loss = np.sum([pulls*kl(mu, x + lip_fun[arm, k]) for k in range(n_arms)])
+        if loss < threshold:
+            p = i
+        else:
+            q = i
+        if p + 1 >= q:
+            # make sure that x is projected to feasible
+            x = interval[i]
+            done = True
+
+    # account for possible non-monotonicity and return the worst case interval if no feasible loss found
+    if mode=="upper":
+        loss = np.sum([pulls*kl(mu, x - lip_fun[arm, k]) for k in range(n_arms)])
+    else:
+        loss = np.sum([pulls*kl(mu, x + lip_fun[arm, k]) for k in range(n_arms)])
+    if loss > threshold:
+        x = interval[-1]
+
+    return x, loss
+
+def kl_bernoulli(mu, lam):
+    return mu * np.log(mu / lam) + (1 - mu) * np.log((1 - mu) / (1 - lam))
+
+def get_confidence_interval_lipschitz(mu, pulls, f_t, lip_fun, upper=6, lower=-1, kl=None):
+    """
+    Compute confidence interval for each arm
+    :param mu: reward vector
+    :param pulls: number of pulls for each arm
+    :param f_t: threshold function f(t) = log t
+    :param upper: upper bound for search
+    :param lower: lower bound for search
+    :param kl: KL divergence function
+    :return:
+        - lower bound for each arm
+        - upper bound for each arm
+    """
+    if kl is None:
+        kl = kl_bernoulli
+    ub = [
+        binary_search_lipschitz(mn[0], mn[1], np.linspace(mn[0], upper, 5000), threshold=f_t, kl=kl, lip_fun=lip_fun, arm=arm, n_arms=len(mu), mode="upper")[0]
+        for arm, mn in enumerate(zip(mu, pulls))
+    ]
+    lb = [
+        binary_search_lipschitz(mn[0], mn[1], np.linspace(mn[0], lower, 5000), threshold=f_t, kl=kl, lip_fun=lip_fun, arm=arm, n_arms=len(mu), mode="lower")[0]
+        for arm, mn in enumerate(zip(mu, pulls))
     ]
 
     return lb, ub
@@ -463,13 +530,14 @@ class Explorer:
         """
 
         hash_tuple = tuple(vertex.tolist())
-        game_value, _ = best_response(
+        game_value, _ = lipschitz_best_response(
             w=self.empirical_allocation(),
             mu=self.means,
             pi=vertex,
-            neighbors=self.neighbors[hash_tuple],
             sigma=self.sigma,
             dist_type=self.dist_type,
+            A=self.A,
+            b=self.b
         )
 
         beta = np.log((1 + np.log(self.t)) / self.delta)
@@ -595,6 +663,36 @@ class TnS(Explorer):
         }
 
         return arm, stop, optimal_policy, misc
+    
+def kl_bernoulli(mu, lam):
+    return mu * np.log(mu / lam) + (1 - mu) * np.log((1 - mu) / (1 - lam))
+    
+def lipschitz_best_response(w,
+            mu,
+            pi,
+            sigma,
+            dist_type,
+            A, 
+            b):
+    A_pi = np.zeros((len(pi)-1, len(pi)))
+    b_pi = np.zeros((len(pi)-1,))
+    best_arm = np.argmax(pi)
+    for k in range(len(b_pi)):
+        if k == best_arm:
+            continue
+        A_pi[k, best_arm] = 1
+        A_pi[k, k] = -1
+        k += 1
+
+    constraints = [LinearConstraint(A, ub=b), LinearConstraint(A_pi, lb=b_pi)]
+
+    def objective(lam):
+        return np.dot(w, kl_bernoulli(mu, lam))
+
+    res = minimize(objective, x0=0.5*np.ones_like(mu), constraints=constraints, method='SLSQP')
+
+    return res.fun, res.x
+    
 
 
 class CGE(Explorer):
@@ -621,6 +719,7 @@ class CGE(Explorer):
         seed=None,
         d_tracking=True,
         use_adahedge=True,
+        lambda_mat=None
     ):
         super().__init__(
             n_arms,
@@ -652,6 +751,8 @@ class CGE(Explorer):
         else:
             self.ada = OnlineGradientDescent(d=n_arms)
 
+        self.lambda_mat = lambda_mat
+
     def act(self):
         """
         Choose an arm to play
@@ -662,40 +763,32 @@ class CGE(Explorer):
             return arm, False, None, None
 
         # Compute optimal policy w.r.t. current empirical means
-        optimal_policy, aux = get_policy(mu=self.means, A=self.A, b=self.b)
-
-        # Check if policy already visited. If yes retrieve neighbors otherwise compute neighbors
-        hash_tuple = tuple(optimal_policy.tolist())  # npy not hashable
-        if hash_tuple in self.neighbors:
-            neighbors = self.neighbors[hash_tuple]
-        else:
-            neighbors = compute_neighbors(
-                optimal_policy, aux["A"], aux["b"], slack=aux["slack"]
-            )
-            self.neighbors[hash_tuple] = neighbors
-
+        optimal_policy = np.zeros_like(self.means)
+        optimal_policy[np.argmax(self.means)] = 1
+        
         # Get allocation from AdaHedge
         allocation = self.ada.get_weights()
-        # Project allocation on feasible set
-        if self.restricted_exploration:
-            allocation = project_on_feasible(allocation, self.A, self.b)
 
         # Perform best response
-        br_value, br_instance = best_response(
+        #TODO: adapt correctly
+        br_value, br_instance = lipschitz_best_response(
             w=allocation,
             mu=self.means,
             pi=optimal_policy,
-            neighbors=neighbors,
             sigma=self.sigma,
             dist_type=self.dist_type,
+            A=self.A,
+            b=self.b
         )
 
         # Compute loss for allocation player
         ft = np.log(self.t)
         # Optimism
+        """lb, ub = get_confidence_interval_lipschitz(
+            self.means, self.n_pulls, ft, kl=self.kl, lower=self.lower, upper=self.upper, lip_fun=self.lambda_mat
+        )"""
         lb, ub = get_confidence_interval(
-            self.means, self.n_pulls, ft, kl=self.kl, lower=self.lower, upper=self.upper
-        )
+            self.means, self.n_pulls, ft, kl=self.kl, lower=self.lower, upper=self.upper)
         loss = [
             np.max(
                 [
@@ -1085,18 +1178,20 @@ class OnlineGradientDescent:
 import time
 
 
-def run_exploration_experiment(bandit, explorer, A, b):
+def run_exploration_experiment(bandit: Bandit, explorer: Explorer):
     """
     Run pure-exploration experiment for a given explorer and return stopping time and correctness
     """
 
-    optimal_policy, _ = get_policy(bandit.get_means(), A, b)
+    optimal_policy = np.zeros_like(bandit.expected_rewards)
+    optimal_policy[np.argmax(bandit.expected_rewards)] = 1 
     done = False
     t = 0
     running_times = []
-
     while not done:
         t += 1
+        if t % 100 == 0:
+            print(t)
         # Act
         running_time = time.time()
         arm, done, policy, log = explorer.act()
